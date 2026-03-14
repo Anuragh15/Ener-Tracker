@@ -1,0 +1,164 @@
+#define BLYNK_TEMPLATE_ID "TMPL3ikVwtGff"
+#define BLYNK_TEMPLATE_NAME "Iot Energy Meter"
+#define BLYNK_PRINT Serial
+
+#include "EmonLib.h"
+#include <EEPROM.h>
+#include <WiFi.h>
+#include <BlynkSimpleEsp32.h>
+#include <Wire.h>
+#include <LiquidCrystal_I2C.h>
+#include <HTTPClient.h>
+#include <ArduinoJson.h>
+#include <LiquidCrystal_PCF8574.h>
+
+LiquidCrystal_I2C lcd(0x27, 16, 2);
+
+const char* telegramBotToken = "*********";
+const char* telegramChatID = "*********";
+
+const float vCalibration = 42.5;
+const float currCalibration = 1.80;
+
+const char auth[] = "6Qvuuvb8SBU5Ycl7RTSl9iQ7yrKh16sS";
+const char ssid[] = "Mnr";
+const char pass[] = "12345678";
+
+EnergyMonitor emon;
+BlynkTimer timer;
+
+float kWh = 0.0;
+float cost = 0.0;
+const float ratePerkWh = 6.5;
+unsigned long lastMillis = millis();
+
+const int addrKWh = 12;
+const int addrCost = 16;
+
+int displayPage = 0;
+const int resetButtonPin = 4;
+
+void sendEnergyDataToBlynk();
+void readEnergyDataFromEEPROM();
+void saveEnergyDataToEEPROM();
+void updateLCD();
+void changeDisplayPage();
+void sendBillToTelegram();
+void resetEEPROM();
+
+void setup() {
+  WiFi.begin(ssid, pass);
+  while (WiFi.status() != WL_CONNECTED) {
+    delay(500);
+  }
+  Blynk.begin(auth, ssid, pass);
+
+  lcd.init();
+  lcd.backlight();
+
+  EEPROM.begin(32);
+  pinMode(resetButtonPin, INPUT_PULLUP);
+  readEnergyDataFromEEPROM();
+
+  emon.voltage(35, vCalibration, 1.7);
+  emon.current(34, currCalibration);
+
+  timer.setInterval(2000L, sendEnergyDataToBlynk);
+  timer.setInterval(2000L, changeDisplayPage);
+  timer.setInterval(60000L, sendBillToTelegram);
+}
+
+void loop() {
+  Blynk.run();
+  timer.run();
+
+  if (digitalRead(resetButtonPin) == LOW) {
+    delay(200);
+    resetEEPROM();
+  }
+}
+
+void sendEnergyDataToBlynk() {
+  emon.calcVI(20, 2000);
+  float Vrms = emon.Vrms;
+  float Irms = emon.Irms;
+  float apparentPower = emon.apparentPower;
+
+  unsigned long currentMillis = millis();
+  kWh += apparentPower * (currentMillis - lastMillis) / 3600000000.0;
+  lastMillis = currentMillis;
+  cost = kWh * ratePerkWh;
+
+  saveEnergyDataToEEPROM();
+
+  Blynk.virtualWrite(V0, Vrms);
+  Blynk.virtualWrite(V1, Irms);
+  Blynk.virtualWrite(V2, apparentPower);
+  Blynk.virtualWrite(V3, kWh);
+  Blynk.virtualWrite(V4, cost);
+
+  updateLCD();
+}
+
+void readEnergyDataFromEEPROM() {
+  EEPROM.get(addrKWh, kWh);
+  EEPROM.get(addrCost, cost);
+
+  if (isnan(kWh)) {
+    kWh = 0.0;
+    saveEnergyDataToEEPROM();
+  }
+  if (isnan(cost)) {
+    cost = 0.0;
+    saveEnergyDataToEEPROM();
+  }
+}
+
+void saveEnergyDataToEEPROM() {
+  EEPROM.put(addrKWh, kWh);
+  EEPROM.put(addrCost, cost);
+  EEPROM.commit();
+}
+
+void updateLCD() {
+  lcd.clear();
+  if (displayPage == 0) {
+    lcd.setCursor(0, 0);
+    lcd.printf("V:%.fV I: %.fA", emon.Vrms, emon.Irms);
+    lcd.setCursor(0, 1);
+    lcd.printf("P: %.f Watt", emon.apparentPower);
+  } else if (displayPage == 1) {
+    lcd.setCursor(0, 0);
+    lcd.printf("Energy: %.2fkWh", kWh);
+    lcd.setCursor(0, 1);
+    lcd.printf("Cost: %.2f", cost);
+  }
+}
+
+void changeDisplayPage() {
+  displayPage = (displayPage + 1) % 2;
+  updateLCD();
+}
+
+void sendBillToTelegram() {
+  String message = "Total Energy Consumed: " + String(kWh, 2) + " kWh\nTotal Cost: ₹" + String(cost, 2);
+  HTTPClient http;
+  http.begin("https://api.telegram.org/bot" + String(telegramBotToken) + "/sendMessage");
+  http.addHeader("Content-Type", "application/json");
+
+  DynamicJsonDocument jsonDoc(256);
+  jsonDoc["chat_id"] = telegramChatID;
+  jsonDoc["text"] = message;
+
+  String jsonString;
+  serializeJson(jsonDoc, jsonString);
+  int httpCode = http.POST(jsonString);
+
+  http.end();
+}
+
+void resetEEPROM() {
+  kWh = 0.0;
+  cost = 0.0;
+  saveEnergyDataToEEPROM();
+}
